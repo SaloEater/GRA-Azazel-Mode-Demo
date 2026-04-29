@@ -8,7 +8,7 @@
 -- Constants
 -- ──────────────────────────────────────────────────────────────────────────────
 
-local AZ_STASH_STORY_ID = "raid_shelter_az_stash"
+local AZ_STASH_STORY_ID = "raid_shelter_box_1"
 
 local HOME_LVID = 222305
 local HOME_GVID = 2531
