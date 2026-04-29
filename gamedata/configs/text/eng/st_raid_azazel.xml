@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<string_table>
+
+    <string id="st_raid_az_go_btn">
+        <text>Go as NPC</text>
+    </string>
+
+    <string id="st_raid_az_returned">
+        <text>You are yourself again.</text>
+    </string>
+
+    <string id="st_raid_az_no_npcs">
+        <text>No eligible NPCs found on this level — returning home.</text>
+    </string>
+
+</string_table>

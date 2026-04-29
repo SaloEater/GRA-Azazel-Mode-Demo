@@ -1,0 +1,763 @@
+-- NPC Raid Mode
+-- Lets the player possess a random NPC upon arriving at a raid level.
+-- Before departure: actor inventory is stripped to a stash, identity is snapshotted.
+-- On death during the raid: actor teleports back home, identity + inventory restored.
+-- On voluntary return home: raid loot goes to stash, pre-raid items return to actor.
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Constants
+-- ──────────────────────────────────────────────────────────────────────────────
+
+local AZ_STASH_STORY_ID = "raid_shelter_az_stash"
+
+local HOME_LVID = 222305
+local HOME_GVID = 2531
+
+-- Sections that stay on actor at all times (never sent to stash).
+function is_keep_section(sec)
+    return sec == "bolt" or sec == "bolt_bullet"
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- State
+-- ──────────────────────────────────────────────────────────────────────────────
+
+local active   = false  -- mode is running
+local backup   = nil    -- {name, rank, faction, reputation, icon, goodwill={}, items={}}
+local pending  = false  -- teleport fired, possession not yet triggered
+local stash_id = nil    -- alife server ID of the persistent stash box
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Helpers
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function get_stash()
+    return stash_id and level.object_by_id(stash_id)
+end
+
+function send_tip(str_id)
+    if db.actor then
+        news_manager.send_tip(db.actor, game.translate_string(str_id), 3, nil, 6000)
+    end
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Inventory helpers
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function collect_actor_items()
+    local t = {}
+    db.actor:iterate_inventory(function(_, item)
+        if not is_keep_section(item:section()) then
+            t[#t + 1] = item
+        end
+    end, db.actor)
+    return t
+end
+
+-- Strip actor inventory into stash; save {id, slot} pairs in backup.items.
+function strip_actor_to_stash()
+    local stash = get_stash()
+    if not stash then
+        printf("! raid_azazel_mode: stash not found, inventory NOT backed up")
+        return
+    end
+    local id_to_slot = {}
+    for s = 1, 15 do
+        local slotted = db.actor:item_in_slot(s)
+        if slotted then id_to_slot[slotted:id()] = s end
+    end
+    for _, item in ipairs(collect_actor_items()) do
+        local iid = item:id()
+        backup.items[#backup.items + 1] = { id = iid, slot = id_to_slot[iid], belt = db.actor:is_on_belt(item) or nil }
+        db.actor:transfer_item(item, stash)
+    end
+end
+
+-- Move current actor items (raid loot) to stash, then restore backed-up items.
+function swap_inventory_on_return()
+    local stash = get_stash()
+    if not stash then
+        printf("! raid_azazel_mode: stash not found, inventory swap skipped")
+        return
+    end
+    -- raid loot → stash
+    for _, item in ipairs(collect_actor_items()) do
+        db.actor:transfer_item(item, stash)
+    end
+    -- backed-up items → actor, collecting slot/belt assignments
+    local slot_map = {}
+    local belt_set = {}
+    if backup and backup.items then
+        for _, entry in ipairs(backup.items) do
+            local id   = type(entry) == "table" and entry.id   or entry
+            local slot = type(entry) == "table" and entry.slot or nil
+            local belt = type(entry) == "table" and entry.belt or nil
+            local item = level.object_by_id(id)
+            if item then
+                stash:transfer_item(item, db.actor)
+                if belt then belt_set[id] = true
+                elseif slot then slot_map[id] = slot end
+            end
+        end
+    end
+    az_reequip_slots(slot_map, belt_set)
+end
+
+function az_reequip_slots(slot_map, belt_set)
+    CreateTimeEvent("raid_az_reequip_e", "raid_az_reequip_a", 1, function()
+        if not (db.actor and db.actor:alive()) then return true end
+        db.actor:iterate_inventory(function(_, item)
+            local id = item:id()
+            if belt_set[id] then
+                db.actor:move_to_belt(item)
+            else
+                local slot = slot_map[id]
+                if slot and not db.actor:item_in_slot(slot) then
+                    db.actor:move_to_slot(item, slot)
+                end
+            end
+        end, db.actor)
+        printf("raid_azazel_mode: slot re-equip done")
+        return true
+    end)
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Identity backup / restore
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function backup_actor()
+    local se_actor = alife():actor()
+    local gw = {}
+    for _, c in pairs(utils_obj.get_communities_list()) do
+        gw[c] = relation_registry.community_goodwill(c, 0)
+    end
+    local tmp_drink = {}
+    actor_status_thirst.save_state(tmp_drink)
+    local tmp_sleep = {}
+    actor_status_sleep.save_state(tmp_sleep)
+    backup = {
+        name       = se_actor:character_name(),
+        rank       = se_actor:rank(),
+        faction    = get_actor_true_community(),
+        reputation = db.actor:character_reputation(),
+        icon       = se_actor:character_icon(),
+        goodwill   = gw,
+        health     = db.actor.health,
+        satiety    = db.actor.satiety,
+        drink      = tmp_drink.drink,
+        sleep_data = tmp_sleep.sleep,
+        items      = {},
+    }
+end
+
+function restore_actor()
+    if not backup then return end
+    local se_actor = alife():actor()
+    se_actor:set_character_name(backup.name)
+    se_actor:set_rank(backup.rank)
+    set_actor_true_community(backup.faction)
+    db.actor:set_character_reputation(backup.reputation)
+    if db.actor_binder then
+        db.actor_binder.character_icon = backup.icon
+        db.actor:set_character_icon(backup.icon)
+    end
+    for community, val in pairs(backup.goodwill) do
+        relation_registry.set_community_goodwill(community, 0, val)
+    end
+    game_statistics.check_for_rank_change(true)
+    game_statistics.check_for_reputation_change(true)
+    db.actor.health  = backup.health
+    db.actor.satiety = backup.satiety
+    if backup.drink then
+        actor_status_thirst.load_state({ drink = backup.drink })
+    end
+    if backup.sleep_data then
+        actor_status_sleep.load_state({ sleep = backup.sleep_data })
+    end
+    send_tip("st_raid_az_returned")
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Possession
+-- ──────────────────────────────────────────────────────────────────────────────
+
+-- Sections never copied from NPC to actor (mirrors vanilla Azazel ignore_list).
+AZ_IGNORE_GEAR = {
+    ["cash"]               = true,
+    ["device_flashlight"]  = true,
+    ["bolt"]               = true,
+    ["device_pda"]         = true,
+    ["medkit_script"]      = true,
+    ["guitar_a"]           = true,
+    ["harmonica_a"]        = true,
+    ["anim_binoc"]         = true,
+    ["anim_knife"]         = true,
+    ["hand_radio"]         = true,
+    ["hand_radio_r"]       = true,
+    ["stick_bred"]         = true,
+    ["stick_kolbasa"]      = true,
+    ["stick_kolbasa_bred"] = true,
+    ["wpn_knife"]          = true,
+    ["pda_for_nps"]        = true,
+    ["sigaret_for_nps"]    = true,
+}
+
+local trader_autoinject_timed_update_orig = trader_autoinject.timed_update
+function trader_autoinject.timed_update(npc)
+    if npc then
+        local ok = pcall(npc.alive, npc)
+        if not ok then return true end
+    end
+    return trader_autoinject_timed_update_orig(npc)
+end
+
+-- Spawn one item parented to the server actor with a specific condition baked into
+-- the packet, avoiding the timing issues of calling set_condition() after spawn.
+function az_spawn_with_condition(sec, se_parent, cond)
+    local se_new = alife_create(sec,
+        se_parent.position,
+        se_parent.m_level_vertex_id,
+        se_parent.m_game_vertex_id,
+        se_parent.id, false)
+    if not se_new then return nil end
+    -- Use get_item_data/set_item_data directly (same as death_manager.spawn_with_condition).
+    -- set_object_data silently skips EQU_STLK / EQU_HLMET because those classes are absent
+    -- from its dispatch table, so the condition write is a no-op and items register at 100%.
+    local data = utils_stpk.get_item_data(se_new)
+    if data then
+        data.condition = cond
+        utils_stpk.set_item_data(data, se_new)
+    end
+    alife():register(se_new)
+    return se_new.id
+end
+
+local death_manage_try_spawn_ammo = death_manager.try_spawn_ammo
+function death_manager.try_spawn_ammo(npc)
+    local _g_parse_list = _G.parse_list
+    _G.parse_list = function(ini, sec, prop)
+        local ret = _g_parse_list(ini, sec, prop)
+        if prop ~= "ammo_class" then return ret end
+        local filtered = {}
+        for _, item in ipairs(ret) do
+            if not item:find("_bad") and not item:find("_verybad") then
+                filtered[#filtered + 1] = item
+            else
+                printf("raid_azazel_mode: death_manager.try_spawn_ammo filtered out [%s]", item)
+            end
+        end
+        return filtered
+    end
+    death_manage_try_spawn_ammo(npc)
+    _G.parse_list = _g_parse_list
+end
+
+function az_equip_try(attempt)
+    CreateTimeEvent("raid_az_equip_e", "raid_az_equip_" .. attempt, 1, function()
+        if not (db.actor and db.actor:alive()) then return true end
+
+        local outfit, helmet, pda
+        db.actor:iterate_inventory(function(_, item)
+            local cls = item:clsid()
+            if not outfit and IsOutfit(nil, cls)   then outfit = item end
+            if not helmet and IsHeadgear(nil, cls) then helmet = item end
+            if not pda and string.find(item:section(), "device_pda_") then pda = item end
+        end, db.actor)
+
+        if not outfit then
+            if attempt < 20 then
+                printf("raid_azazel_mode: no outfit yet, equip retry %s/20", attempt + 1)
+                az_equip_try(attempt + 1)
+            else
+                printf("! raid_azazel_mode: no outfit after 20 attempts, giving up")
+            end
+            return true
+        end
+
+        if not db.actor:item_in_slot(7)  then db.actor:move_to_slot(outfit, 7)  end
+        if helmet and not db.actor:item_in_slot(12) then db.actor:move_to_slot(helmet, 12) end
+        if pda    and not db.actor:item_in_slot(8)  then db.actor:move_to_slot(pda,    8)  end
+        death_manager.try_spawn_ammo(db.actor)
+        printf("raid_azazel_mode: auto-equip done on attempt %s", attempt + 1)
+        return true
+    end)
+end
+
+function apply_possession(se_obj)
+    local se_actor = alife():actor()
+    local faction  = se_obj:community()
+
+    printf("raid_azazel_mode: apply_possession start — NPC id=%s faction=[%s] rank=%s",
+        se_obj.id, faction, se_obj:rank())
+
+    se_actor:set_character_name(se_obj:character_name())
+    se_actor:set_rank(se_obj:rank())
+    set_actor_true_community(faction)
+    db.actor:set_character_reputation(se_obj:reputation())
+
+    if db.actor_binder then
+        db.actor_binder.character_icon = se_obj:character_icon()
+        db.actor:set_character_icon(db.actor_binder.character_icon)
+    end
+
+    printf("raid_azazel_mode: identity transferred — id=[%s] faction=[%s]",se_obj.id,faction)
+
+    game_relations.set_community_goodwill_for_faction(faction)
+    game_statistics.check_for_rank_change(true)
+    game_statistics.check_for_reputation_change(true)
+
+    local npc_client = level.object_by_id(se_obj.id)
+    db.actor:set_actor_position(npc_client and npc_client:position() or se_obj.position)
+    printf("raid_azazel_mode: actor repositioned to NPC position (client=%s)", tostring(npc_client ~= nil))
+
+    -- Copy NPC inventory to actor with dead-body conditions (vanilla Azazel pattern).
+    -- Weapons and armor get degraded condition baked at packet level; other items spawn
+    -- at full condition via give_object_to_actor.
+    local sim = alife()
+    local gear_count = 0
+    for i = 1, 65534 do
+        local se_item = sim:object(i)
+        if se_item and se_item.parent_id == se_obj.id then
+            local sec = se_item:section_name()
+            if not AZ_IGNORE_GEAR[sec] then
+                local cls = se_item:clsid()
+                if IsWeapon(nil, cls) then
+                    local cond = math.random(10, 40) / 100
+                    printf("raid_azazel_mode:   gear weapon [%s] cond=%s", sec, cond)
+                    az_spawn_with_condition(sec, se_actor, cond)
+                elseif IsOutfit(nil, cls) or IsHeadgear(nil, cls) then
+                    local cond = math.random(10, 30) / 100
+                    printf("raid_azazel_mode:   gear armor  [%s] cond=%s", sec, cond)
+                    az_spawn_with_condition(sec, se_actor, cond)
+                else
+                    printf("raid_azazel_mode:   gear misc   [%s]", sec)
+                    give_object_to_actor(sec)
+                end
+                gear_count = gear_count + 1
+            else
+                printf("raid_azazel_mode:   gear ignored [%s]", sec)
+            end
+        end
+    end
+    printf("raid_azazel_mode: gear transfer done — %s item(s) given", gear_count)
+
+    -- Faction-appropriate ammo and cosmetic outfit/helmet with rank-based dead-body
+    -- conditions (rand_condition=false → get_condition_by_rank, not the 75-85% path).
+    local npc_data   = utils_stpk.get_stalker_data(se_obj)
+    local npc_visual = npc_data and npc_data.visual_name
+    local rank_name  = ranks.get_obj_rank_name(db.actor)
+    printf("raid_azazel_mode: loot lists, cosmetics — rank=[%s] visual=[%s]",
+        rank_name, tostring(npc_visual))
+
+    -- Spawn community and private items using the NPC as the data source, but redirect
+    -- alife_create_item so everything lands on the actor instead of the NPC.
+    local npc_for_loot = level.object_by_id(se_obj.id)
+    local loot_target  = npc_for_loot or db.actor
+    printf("raid_azazel_mode: loot target is %s", npc_for_loot and "online NPC" or "actor fallback")
+    local real_aci = _G.alife_create_item
+    _G.alife_create_item = function(sec, obj, params)
+        printf("raid_azazel_mode: alife_create_item called for [%s]", sec)
+        return real_aci(sec, db.actor, params)
+    end
+    death_manager.create_item_list(loot_target, faction, rank_name, false)
+    death_manager.create_item_list(loot_target, faction, rank_name, true)
+    _G.alife_create_item = real_aci
+
+
+    local tbl        = npc_visual and death_manager.get_outfit_by_npc_visual(npc_visual)
+    local outfit_sec = tbl and tbl[1]
+    local helmet_sec = tbl and tbl[2]
+	local min_cond = ui_mcm.get('dph_loot_cond/outfit/' .. rank_name .. '_min')
+	local max_cond = ui_mcm.get('dph_loot_cond/outfit/' .. rank_name .. '_max')
+    local gear_cond = math.random(min_cond, max_cond) / 100
+
+    if outfit_sec and ini_sys:section_exist(outfit_sec) then
+        az_spawn_with_condition(outfit_sec, se_actor, gear_cond)
+        printf("raid_azazel_mode: spawned outfit [%s] cond=%s", outfit_sec, gear_cond)
+    else
+        az_spawn_with_condition("novice_outfit", se_actor, gear_cond)
+        printf("raid_azazel_mode: no visual match for [%s], spawned novice_outfit", tostring(npc_visual))
+    end
+
+    gear_cond = math.random(min_cond, max_cond) / 100
+    if helmet_sec and ini_sys:section_exist(helmet_sec) then
+        az_spawn_with_condition(helmet_sec, se_actor, gear_cond)
+        printf("raid_azazel_mode: spawned helmet [%s] cond=%s", helmet_sec, gear_cond)
+    end
+
+    if ini_sys:section_exist(faction .. "_patch") then
+        give_object_to_actor(faction .. "_patch")
+    end
+
+    give_object_to_actor("device_pda_1")
+
+    -- Auto-equip outfit (7), helmet (12), and PDA (8) once items come online.
+    az_equip_try(0)
+
+    if npc_client then
+        npc_client:kill(npc_client)
+        printf("raid_azazel_mode: killed NPC client object")
+    end
+    local se_id = se_obj.id
+    CreateTimeEvent("raid_az_release_e", "raid_az_release_a", 3, function()
+        local se = alife():object(se_id)
+        if se then
+            safe_release_manager.release(se)
+            printf("raid_azazel_mode: released NPC se_obj id=%s", se_id)
+        end
+        return true
+    end)
+
+    bind_stalker_ext.invulnerable_time = time_global() + 30000
+    gamemode_azazel.heal_everything()
+    level.add_pp_effector("deimos1.ppe", 210410, false)
+
+    printf("raid_azazel_mode: possessed NPC [%s] faction [%s]", se_obj:character_name(), faction)
+end
+
+function trigger_possession(retries)
+    retries = retries or 0
+    printf("raid_azazel_mode: trigger_possession attempt %s", retries)
+
+    local sim        = alife()
+    local actor_lvl  = game_graph():vertex(alife():actor().m_game_vertex_id):level_id()
+    local candidates = {}
+    for i = 1, 65534 do
+        local se_obj = sim:object(i)
+        if se_obj
+           and IsStalker(nil, se_obj:clsid())
+           and se_obj:alive()
+           and se_obj:community() ~= "zombied"
+           and se_obj:community() ~= "trader"
+           and se_obj:community() ~= "monolith"
+           and se_obj:community() ~= "greh"
+           and se_obj.group_id ~= 65535
+           and get_object_story_id(se_obj.group_id) == nil
+           and game_graph():vertex(se_obj.m_game_vertex_id):level_id() == actor_lvl
+        then
+            local squad = alife_object(se_obj.group_id)
+            if squad and squad:commander_id() == se_obj.id then
+                printf("raid_azazel_mode:   skip commander id=%s name=[%s]",
+                    se_obj.id, se_obj:character_name())
+            else
+                candidates[#candidates + 1] = se_obj.id
+                printf("raid_azazel_mode:   candidate id=%s name=[%s] faction=[%s] group=%s online=%s",
+                    se_obj.id, se_obj:character_name(), se_obj:community(), se_obj.group_id,
+                    tostring(level.object_by_id(se_obj.id) ~= nil))
+            end
+        end
+    end
+
+    printf("raid_azazel_mode: found %s candidate(s)", #candidates)
+
+    if #candidates == 0 then
+        if retries < 5 then
+            printf("raid_azazel_mode: no candidates, retrying in 2s (retry %s/5)", retries + 1)
+            -- retry in 2 s; unique action ID uses retry count so it doesn't collide
+            CreateTimeEvent("raid_az_possess_e", "raid_az_possess_" .. retries, 2,
+                trigger_possession, retries + 1)
+            return true
+        end
+        -- all retries exhausted — abort and send player home
+        printf("! raid_azazel_mode: no eligible NPCs after retries, aborting")
+        send_tip("st_raid_az_no_npcs")
+        swap_inventory_on_return()
+        restore_actor()
+        active  = false
+        backup  = nil
+        pending = false
+        local home_pos = vector():set(618.37, -43.845, 197.48)
+        level.add_pp_effector("sleep_fade.ppe", 1313, false)
+        CreateTimeEvent("raid_az_abort_e", "raid_az_abort_a", 1.5, function()
+            ChangeLevel(home_pos, HOME_LVID, HOME_GVID, VEC_ZERO)
+            return true
+        end)
+        return true
+    end
+
+    local se_obj = alife_object(candidates[math.random(#candidates)])
+    if not se_obj then
+        printf("! raid_azazel_mode: selected candidate vanished before possession")
+        return true
+    end
+
+    printf("raid_azazel_mode: selected NPC id=%s name=[%s] faction=[%s]",
+        se_obj.id, se_obj:character_name(), se_obj:community())
+
+    -- Teleport actor near the NPC's smart terrain so the NPC goes online,
+    -- then wait for the client object before possessing.
+    local pre_pos  = se_obj.position
+    local pre_lvid = se_obj.m_level_vertex_id
+    local pre_gvid = se_obj.m_game_vertex_id
+
+    if se_obj.group_id ~= 65535 then
+        local squad = alife_object(se_obj.group_id)
+        if squad and squad.smart_id and squad.smart_id ~= 65535 then
+            local smart = alife_object(squad.smart_id)
+            if smart then
+                pre_pos  = smart.position
+                pre_lvid = smart.m_level_vertex_id
+                pre_gvid = smart.m_game_vertex_id
+                printf("raid_azazel_mode: pre-teleport to smart id=%s", squad.smart_id)
+            end
+        end
+    end
+
+    bind_stalker_ext.invulnerable_time = time_global() + 60000
+    gamemode_azazel.heal_everything()
+    db.actor:set_actor_position(pre_pos)
+    level.add_pp_effector("deimos1.ppe", 210410, false)
+
+    wait_for_online_then_possess(se_obj.id, 0)
+    return true
+end
+
+function wait_for_online_then_possess(se_id, attempts)
+    local se_obj = alife_object(se_id)
+    if not se_obj then
+        printf("! raid_azazel_mode: wait_for_online NPC %s gone, picking new candidate", se_id)
+        trigger_possession(0)
+        return true
+    end
+
+    if level.object_by_id(se_id) then
+        printf("raid_azazel_mode: NPC %s online after %s poll(s), possessing", se_id, attempts)
+        apply_possession(se_obj)
+        return true
+    end
+
+    if attempts >= 20 then
+        printf("! raid_azazel_mode: NPC %s still offline after 10s, picking new candidate", se_id)
+        trigger_possession(0)
+        return true
+    end
+
+    printf("raid_azazel_mode: waiting for NPC %s to come online (attempt %s)", se_id, attempts)
+    CreateTimeEvent("raid_az_online_e", "raid_az_online_" .. attempts, 0.5,
+        wait_for_online_then_possess, se_id, attempts + 1)
+    return true
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Teleport to raid
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function teleport_to_raid(level_name)
+    -- Collect eligible space restrictors on the chosen level (same filter as
+    -- raid_travel_manager.raid_teleport).
+    local tp_ini = ini_file("sr_teleport_sections.ltx")
+    local space_t = {}
+    for i = 1, 65534 do
+        local se_obj = alife_object(i)
+        if se_obj
+           and se_obj:clsid() == clsid.script_restr
+           and se_obj:section_name() == "space_restrictor"
+           and string.find(se_obj:name(), "_space_restrictor_to_")
+        then
+            local lid = game_graph():vertex(se_obj.m_game_vertex_id):level_id()
+            local lname = lid and alife():level_name(lid)
+            if lname == level_name then
+                space_t[se_obj.id] = true
+            end
+        end
+    end
+
+    local rnd_id = size_table(space_t) > 0 and random_key_table(space_t)
+    local rnd_space = rnd_id and alife_object(rnd_id)
+    if not rnd_space then
+        printf("! raid_azazel_mode: no space restrictor found for [%s]", level_name)
+        return false
+    end
+
+    local cpath  = tp_ini:r_string_ex(rnd_space:name(), "reject_path")
+    local cpoint = cpath and patrol(cpath)
+    if not cpoint then
+        printf("! raid_azazel_mode: cpoint not found for restrictor [%s]", rnd_space:name())
+        return false
+    end
+
+    local pos  = cpoint:point(0)
+    local lvid = cpoint:level_vertex_id(0) or 2^32 - 1
+    local gvid = cpoint:game_vertex_id(0) or 2^16 - 1
+
+    level.add_pp_effector("sleep_fade.ppe", 1313, false)
+    CreateTimeEvent("raid_az_travel_e", "raid_az_travel_a", 3, function()
+        ChangeLevel(pos, lvid, gvid, VEC_ZERO)
+        return true
+    end)
+    return true
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Stash box spawn
+-- ──────────────────────────────────────────────────────────────────────────────
+
+-- quest_box position for reference: { 649.33, -43.7, 180.35 }, gvid=2529
+local AZ_STASH_POS  = { 639.82, -43.68, 186.22 }
+
+function spawn_az_stash()
+    if stash_id and alife():object(stash_id) then return end
+    local pos    = vector():set(AZ_STASH_POS[1], AZ_STASH_POS[2], AZ_STASH_POS[3])
+    local se_obj = alife_create(AZ_STASH_STORY_ID, pos, 226282, 2534)
+    if se_obj then
+        stash_id    = se_obj.id
+        se_obj.angle = vector():set(0, math.pi / 2, 0)
+        printf("raid_azazel_mode: az stash spawned (id=%s)", stash_id)
+    else
+        printf("! raid_azazel_mode: az stash spawn failed")
+    end
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Public entry point (called from the notebook button)
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function try_start_npc_raid()
+    if active then return end
+    if level.name() ~= raid_utils.raid_home_level then return end
+
+    -- Pick a random level from the raid simulation table
+    local levels = {}
+    for lname, _ in pairs(raid_simulation.raid_sim_t) do
+        levels[#levels + 1] = lname
+    end
+    if #levels == 0 then
+        printf("! raid_azazel_mode: raid_sim_t is empty")
+        return
+    end
+    local chosen = levels[math.random(#levels)]
+
+    exec_console_cmd("save " .. (user_name() or "Raid") .. " - raid")
+    backup_actor()
+    strip_actor_to_stash()
+
+    active  = true
+    pending = true
+
+    if not teleport_to_raid(chosen) then
+        -- teleport failed — roll back
+        swap_inventory_on_return()
+        backup  = nil
+        active  = false
+        pending = false
+    else
+        printf("raid_azazel_mode: NPC Raid started, destination [%s]", chosen)
+    end
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Callbacks
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function save_state(m_data)
+    m_data.raid_az_active   = active
+    m_data.raid_az_pending  = pending
+    m_data.raid_az_backup   = backup
+    m_data.raid_az_stash_id = stash_id
+end
+
+function load_state(m_data)
+    active   = m_data.raid_az_active   or false
+    pending  = m_data.raid_az_pending  or false
+    backup   = m_data.raid_az_backup   or nil
+    stash_id = m_data.raid_az_stash_id or nil
+end
+
+local raid_simulation_actor_on_first_update = raid_simulation.actor_on_first_update
+raid_simulation.actor_on_first_update = function(...)
+    printf("raid_azazel_mode: raid_simulation.actor_on_first_update called")
+    local res = raid_simulation_actor_on_first_update(...)
+    printf("raid_azazel_mode: raid_simulation.actor_on_first_update finished")
+    actor_on_first_update()
+    return res
+end
+
+function actor_on_first_update()
+    -- Spawn the stash box once at the home level (guard prevents re-runs).
+    if level.name() == raid_utils.raid_home_level then
+        spawn_az_stash()
+    end
+
+    if not active then return end
+
+    local at_home = (level.name() == raid_utils.raid_home_level)
+
+    if pending and not at_home then
+        pending = false
+        CreateTimeEvent("raid_az_possess_e", "raid_az_possess_a", 3, trigger_possession, 0)
+    end
+
+    if not pending and at_home and backup then
+        swap_inventory_on_return()
+        restore_actor()
+        active  = false
+        backup  = nil
+    end
+end
+
+function actor_on_before_death(whoID, flags)
+    if not active then return end
+    flags.ret_value = false  -- suppress death; prevents other death handlers acting
+    swap_inventory_on_return()
+    restore_actor()
+    active  = false
+    backup  = nil
+    pending = false
+    local home_pos = vector():set(618.37, -43.845, 197.48)
+    level.add_pp_effector("sleep_fade.ppe", 1313, false)
+    CreateTimeEvent("raid_az_home_e", "raid_az_home_a", 1.5, function()
+        ChangeLevel(home_pos, HOME_LVID, HOME_GVID, VEC_ZERO)
+        return true
+    end)
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- RaidNotebook monkey patch
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function patch_notebook_gui()
+    local RN = raid_notebook_gui.RaidNotebook
+
+    local orig_InitControls = RN.InitControls
+    RN.InitControls = function(self)
+        orig_InitControls(self)
+        self.npc_raid_btn = self.xml:Init3tButton("npc_raid_btn", self.pic_bg)
+        self:Register(self.npc_raid_btn, "npc_raid_btn")
+    end
+
+    local orig_InitCallBacks = RN.InitCallBacks
+    RN.InitCallBacks = function(self)
+        orig_InitCallBacks(self)
+        self:AddCallback("npc_raid_btn", ui_events.BUTTON_CLICKED,
+            self.OnClickNpcRaid, self)
+    end
+
+    RN.OnClickNpcRaid = function(self)
+        self:Close()
+        try_start_npc_raid()
+    end
+
+    local orig_Update = RN.Update
+    RN.Update = function(self)
+        orig_Update(self)
+        if self.npc_raid_btn then
+            self.npc_raid_btn:Enable(
+                level.name() == raid_utils.raid_home_level and not active
+            )
+        end
+    end
+end
+
+-- ──────────────────────────────────────────────────────────────────────────────
+-- Startup
+-- ──────────────────────────────────────────────────────────────────────────────
+
+function on_game_start()
+    RegisterScriptCallback("save_state",            save_state)
+    RegisterScriptCallback("load_state",            load_state)
+    --RegisterScriptCallback("actor_on_first_update", actor_on_first_update)
+    RegisterScriptCallback("actor_on_before_death", actor_on_before_death)
+    patch_notebook_gui()
+end

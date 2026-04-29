@@ -1,0 +1,19 @@
+-- DXML patch: injects the "Go as NPC" button into ui_raid_notebook_16.xml.
+-- Button is positioned below main_items_btn (y=580) and styled like the
+-- other nav buttons. The Lua side is wired in raid_azazel_mode.script.
+
+function on_xml_read()
+    RegisterScriptCallback("on_xml_read", function(xml_file_name, xml_obj)
+        if xml_file_name ~= [[ui\ui_raid_notebook_16.xml]] then return end
+
+        -- Guard: skip if already injected (e.g. hot-reload scenario)
+        if not is_empty(xml_obj:query("npc_raid_btn")) then return end
+
+        xml_obj:insertFromXMLString([[
+<npc_raid_btn x="125" y="110" width="105" height="140" stretch="1">
+    <text complex_mode="1" r="190" g="190" b="190" vert_align="c" align="c" font="letterica18"></text>
+    <texture>raid_notebook_azazel_btn</texture>
+</npc_raid_btn>
+]])
+    end)
+end
